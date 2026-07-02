@@ -1,0 +1,222 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Kiro Coding Metrics Collector —【复用客户现有 VPC】版。
+  只创建 RDS PostgreSQL + EC2(Dashboard) + 安全组 + 实例角色，
+  完全不创建/不修改客户已有的 VPC/子网/路由/NAT。
+  适用于客户环境中 VPC 与私有子网已存在的情况。
+
+# ------------------------------------------------------------
+# 参数（把客户现有网络作为输入传入）
+# ------------------------------------------------------------
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 客户现有 VPC 的 ID
+
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: 客户现有的【两个私有子网】ID（必须分属不同可用区——RDS 子网组的硬性要求）。EC2 落在列表第 1 个子网。
+
+  VpcCidr:
+    Type: String
+    Default: 10.162.255.0/24
+    Description: 客户 VPC 的 CIDR；用于安全组放行（也可改成更小的开发者网段以收紧）
+
+  AppIngressCidr:
+    Type: String
+    Default: ""
+    Description: （可选）允许访问 80/3500 的来源 CIDR；留空则用 VpcCidr。生产建议填开发者/VPN 网段。
+
+  DBUsername:
+    Type: String
+    Default: kiroadmin
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: RDS 主用户口令（8+ 位，避免 / @ " 空格 等特殊字符）
+  DBName:
+    Type: String
+    Default: kiro
+
+  IdentityStoreId:
+    Type: String
+    Default: ""
+    Description: （可选）IAM Identity Center Identity Store ID；用于 /api/users 用户同步，没有就留空
+
+  DeployBucket:
+    Type: String
+    Description: 存放 kiro-dashboard-src.tgz 的 S3 桶名（EC2 从此拉取代码）
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Conditions:
+  UseVpcCidrForIngress: !Equals [!Ref AppIngressCidr, ""]
+
+Resources:
+  # ---------------- 安全组 ----------------
+  AppSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Kiro dashboard app SG (existing VPC)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !If [UseVpcCidrForIngress, !Ref VpcCidr, !Ref AppIngressCidr]
+        - IpProtocol: tcp
+          FromPort: 3500
+          ToPort: 3500
+          CidrIp: !If [UseVpcCidrForIngress, !Ref VpcCidr, !Ref AppIngressCidr]
+      Tags: [{ Key: Name, Value: kiro-app-sg }, { Key: Project, Value: kiro-metrics-rds }]
+
+  DbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Kiro RDS SG (existing VPC)
+      VpcId: !Ref VpcId
+      Tags: [{ Key: Name, Value: kiro-db-sg }, { Key: Project, Value: kiro-metrics-rds }]
+  DbSgIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DbSg
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref AppSg   # 仅 app SG 可访问 5432
+
+  # ---------------- RDS（私有子网组）----------------
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Kiro metrics — customer existing private subnets
+      SubnetIds: !Ref PrivateSubnetIds
+      Tags: [{ Key: Project, Value: kiro-metrics-rds }]
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: kiro-metrics-pg
+      Engine: postgres
+      EngineVersion: "16.14"
+      DBInstanceClass: db.t4g.micro
+      AllocatedStorage: "20"
+      StorageType: gp3
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSg]
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 1
+      Tags: [{ Key: Project, Value: kiro-metrics-rds }]
+
+  # ---------------- EC2 实例角色（SSM + 读取部署桶 + 可选同步只读）----------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: sts:AssumeRole }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: kiro-ec2-extra
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # 部署桶（拉取代码）。如需限定 credit 同步的 Kiro 报告桶，可把其 ARN 也加进来。
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource:
+                  - !Sub "arn:aws:s3:::${DeployBucket}"
+                  - !Sub "arn:aws:s3:::${DeployBucket}/*"
+              # Dashboard 应用运行所需（对应代码里的全部 AWS 调用）：
+              #   用户同步 identitystore:ListUsers/DescribeUser
+              #   session 同步 cloudtrail:LookupEvents
+              #   credit 同步 s3:ListObjectsV2(ListBucket)/GetObject —— Kiro 活动报告桶
+              - Effect: Allow
+                Action: [identitystore:ListUsers, identitystore:DescribeUser, cloudtrail:LookupEvents]
+                Resource: "*"
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  # ---------------- EC2（落在客户第 1 个私有子网）----------------
+  DashboardInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Select [0, !Ref PrivateSubnetIds]
+      SecurityGroupIds: [!Ref AppSg]
+      IamInstanceProfile: !Ref InstanceProfile
+      Tags: [{ Key: Name, Value: kiro-dashboard-ec2 }, { Key: Project, Value: kiro-metrics-rds }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          # 注意：本子网需具备出网能力（NAT 或 NodeSource/npm 可达）；
+          # 若为隔离子网，请改用预装 Node 的自定义 AMI 或内网镜像源。
+          curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+          dnf install -y nodejs gcc-c++ make
+          mkdir -p /opt/kiro && cd /opt/kiro
+          aws s3 cp s3://${DeployBucket}/kiro-dashboard-src.tgz ./src.tgz --region ${AWS::Region}
+          tar -xzf src.tgz
+          cd /opt/kiro/kiro-dashboard
+          npm install --omit=dev
+          cat > .env <<ENV
+          DB_HOST=${Database.Endpoint.Address}
+          DB_PORT=${Database.Endpoint.Port}
+          DB_NAME=${DBName}
+          DB_USER=${DBUsername}
+          DB_PASSWORD=${DBPassword}
+          DB_SSL=require
+          AWS_REGION=${AWS::Region}
+          IDENTITY_STORE_ID=${IdentityStoreId}
+          INGEST_PORT=80
+          DASHBOARD_PORT=3500
+          ENV
+          chmod 600 .env
+          cat > /etc/systemd/system/kiro-dashboard.service <<UNIT
+          [Unit]
+          Description=Kiro Coding Metrics Dashboard
+          After=network-online.target
+          Wants=network-online.target
+          [Service]
+          Type=simple
+          WorkingDirectory=/opt/kiro/kiro-dashboard
+          ExecStart=/usr/bin/node /opt/kiro/kiro-dashboard/src/main.js
+          Restart=always
+          RestartSec=5
+          User=root
+          AmbientCapabilities=CAP_NET_BIND_SERVICE
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          systemctl daemon-reload
+          systemctl enable --now kiro-dashboard
+
+# ------------------------------------------------------------
+# 输出
+# ------------------------------------------------------------
+Outputs:
+  RdsEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+    Description: RDS PostgreSQL 终端节点
+  Ec2InstanceId:
+    Value: !Ref DashboardInstance
+  Ec2PrivateIp:
+    Value: !GetAtt DashboardInstance.PrivateIp
+    Description: 把此私有 IP 填入插件 apiConfig.ts 的 STATS_BASE_URL (http://<ip>)，然后重新打包 VSIX
