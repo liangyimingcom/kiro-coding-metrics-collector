@@ -151,4 +151,4 @@ stats.db
 stats.db-shm
 stats.db-wal
 stats.db*
-*.vsix
+# *.vsix  # disabled: need to distribute via git
