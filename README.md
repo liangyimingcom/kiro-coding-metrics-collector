@@ -1,5 +1,35 @@
 # KIRO Coding Metrics Collector
 
+---
+
+## ⚠️ v0.3.5 重要更新（2026-08-14）
+
+**本次更新修复了 v0.2.2 中多项严重 bug，强烈建议立即升级。**
+
+### 修复的严重问题
+
+| # | v0.2.2 问题 | 影响 | v0.3.5 修复 |
+|---|---|---|---|
+| 🔴 1 | ai_deletions 虚高（删了又恢复也计入） | AI 删除指标失真 | 多策略精确计算 + cap |
+| 🔴 2 | ai_additions 含 mixed 行 | AI 占比偏高 | `ai_additions -= mixed_additions` |
+| 🔴 3 | 行数溢出 >100% | 看板百分比异常 | 三值 cap 到 git_diff_added_lines |
+| 🔴 4 | Windows 改名后整文件归 AI | Windows 用户数据严重失真 | 不再跳过 human checkpoint |
+
+### 其他修复与新功能
+
+- 🐛 Kiro delete action 状态兼容
+- 🪟 Windows 路径/PowerShell/curl 三项修复
+- 🆕 新增 Linux x64 支持（单 VSIX 含三平台）
+- 🆕 父目录 workspace / monorepo 支持
+- 🆕 调试日志（`.git/ai/last_upload_payload.json`）
+- ⚡ userSync 优化（去外网依赖）、hostname 主键、仓库验证增强
+
+### 升级方式
+
+卸载旧版 → 安装 `git-ai-kiro-0.3.5.vsix` → 重启 IDE。无需改动 Dashboard。
+
+---
+
 An open-source toolkit that measures AI-generated code contributions in software projects. It consists of a **Kiro IDE plugin** and a **Dashboard web application** that together provide line-level attribution tracking, commit-time metrics calculation, and team-wide visibility into AI coding productivity.
 
 ## Overview
