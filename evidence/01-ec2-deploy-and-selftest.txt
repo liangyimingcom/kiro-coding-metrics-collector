@@ -1,0 +1,64 @@
+[ssm] CommandId=ab343871-a6db-4338-a554-074e6d575f4b  (instance i-0e130b8e7679dcff0)
+[ssm] Status=Success
+----- STDOUT -----
+===== [remote] whoami / env =====
+root
+Linux ip-10-162-255-8.ec2.internal 6.1.175-219.357.amzn2023.x86_64 #1 SMP PREEMPT_DYNAMIC Tue Jun 16 03:47:47 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+===== [remote] Install Node.js 20 (nodesource) =====
+v20.20.2
+10.8.2
+===== [remote] Fetch dashboard source from S3 =====
+Completed 56.3 KiB/56.3 KiB (597.9 KiB/s) with 1 file(s) remainingdownload: s3://kiro-metrics-deploy-774868049561/kiro-dashboard-src.tgz to ../../opt/kiro/src.tgz
+===== [remote] npm install (production) =====
+added 54 packages, and audited 55 packages in 2s
+
+found 0 vulnerabilities
+npm notice
+npm notice New major version of npm available! 10.8.2 -> 11.17.0
+npm notice Changelog: https://github.com/npm/cli/releases/tag/v11.17.0
+npm notice To update run: npm install -g npm@11.17.0
+npm notice
+===== [remote] Write .env (points at RDS) =====
+(.env written, DB_HOST=kiro-metrics-pg.csc7vhhc35lz.us-east-1.rds.amazonaws.com)
+===== [remote] systemd service =====
+Created symlink /etc/systemd/system/multi-user.target.wants/kiro-dashboard.service → /etc/systemd/system/kiro-dashboard.service.
+===== [remote] service status =====
+active
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal systemd[1]: Started kiro-dashboard.service - Kiro Coding Metrics Dashboard (RDS PostgreSQL).
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]: [env] Loaded .env from /opt/kiro/kiro-dashboard/.env
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]: [env] Database connection variables OK:
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]:   DB_HOST=kiro-metrics-pg.csc7vhhc35lz.us-east-1.rds.amazonaws.com
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]:   DB_PORT=5432
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]:   DB_NAME=kiro
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]:   DB_USER=kiroadmin
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]:   DB_PASSWORD=Ki****
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]:   DB_SSL=require
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]: [warn] 以下 AWS 集成变量未配置，对应同步功能将降级跳过（不影响核心采集/查询）:
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]:   KIRO_S3_BUCKET  — Kiro User Activity Report S3 桶（credit 同步需要）
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]:   KIRO_S3_PREFIX  — S3 前缀（credit 同步需要）
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]:   KIRO_ACCOUNT_ID  — AWS 账号 ID（credit 同步需要）
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]: [env] 未检测到静态 AWS 凭据 — 将使用 EC2 实例角色 / 默认凭据链。
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]: [store] PostgreSQL schema ready
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]: [main] Skip credit sync (KIRO_S3_BUCKET / KIRO_ACCOUNT_ID / IDENTITY_STORE_ID 未全部配置)
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]: [sessionSync] Fetching CreateToken events from 2026-05-30T11:22:30.360Z to 2026-06-29T11:22:30.360Z
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]: [sessionSync] Session sync started (initial: 30d, interval: 24h)
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]: (node:26843) Warning: NodeVersionSupportWarning: The AWS SDK for JavaScript (v3)
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]: versions published after the first week of January 2027
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]: will require node >=22. You are running node v20.20.2.
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]: To continue receiving updates to AWS services, bug fixes,
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]: and security updates please upgrade to node >=22.
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]: More information can be found at: https://a.co/c895JFp
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]: (Use `node --trace-warnings ...` to show where the warning was created)
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]: [2026-06-29T11:22:30.368Z] [ingest] Stats ingest API listening on port 80
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]: [dashboard] Dashboard listening on http://localhost:3500
+Jun 29 11:22:30 ip-10-162-255-8.ec2.internal node[26843]: [sessionSync] Failed to sync sessions: User: arn:aws:sts::774868049561:assumed-role/AmazonSSMRoleForInstancesQuickSetup/i-0e130b8e7679dcff0 is not authorized to perform: cloudtrail:LookupEvents because no identity-based policy allows the cloudtrail:LookupEvents action
+===== [remote] local self-test (loopback) =====
+--- POST /api/v1/stats ---
+{"status":"ok"}
+--- GET /api/repos (dashboard:3500) ---
+[{"repo_name":"vpc-demo","branch":"main","commit_sha":"ec2sha001","reported_at":"2026-06-29T12:00:00Z","human_additions":30,"ai_additions":70,"mixed_additions":5,"ai_accepted":68,"git_diff_added_lines":100,"commit_count":1,"time_waiting_for_ai":900,"user_count":1,"by_tool_model":{"Kiro/claude-opus-4":{"ai_additions":70,"mixed_additions":5,"ai_accepted":68,"total_ai_additions":75,"total_ai_deletions":2,"time_waiting_for_ai":900}}}]
+--- GET /api/repos/vpc-demo/aggregate ---
+{"repo_name":"vpc-demo","branch":"main","commit_sha":"ec2sha001","reported_at":"2026-06-29T12:00:00Z","totals":{"human_additions":30,"ai_additions":70,"mixed_additions":5,"ai_accepted":68,"total_ai_additions":75,"total_ai_deletions":2,"time_waiting_for_ai":900,"git_diff_added_lines":100,"git_diff_deleted_lines":3,"ai_deletions":1,"human_deletions":1,"commit_count":1},"by_user":{"deployer@corp.example":{"user_name":"Deployer","user_email":"deployer@corp.example","human_additions":30,"ai_additions":70,"mixed_additions":5,"ai_accepted":68,"git_diff_added_lines":100,"commit_count":1,"time_waiting_for_ai":900}},"by_tool_model":{"Kiro/claude-opus-4":{"ai_additions":70,"mixed_additions":5,"ai_accepted":68,"total_ai_additions":75,"total_ai_deletions":2,"time_waiting_for_ai":900}}}
+===== [remote] DONE =====
+
+[ssm] CommandId=ab343871-a6db-4338-a554-074e6d575f4b Status=Success

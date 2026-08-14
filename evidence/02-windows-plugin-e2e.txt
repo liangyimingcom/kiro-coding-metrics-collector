@@ -1,0 +1,86 @@
+Windows 测试机 — Kiro 插件端到端真实验证证据
+========================================================================
+账号 774868049561 / us-east-1 / 2026-06-30
+
+[测试机]
+  实例     i-00a83bf17de47d6dc  Windows Server 2022  t3.large
+  子网     公有子网 10.162.255.128/26（同 VPC，天然可达私有 dashboard）
+  私有IP   10.162.255.159   主机名 EC2AMAZ-INC6DOR
+  连接     SSM 端口转发 RDP（本地 13389 -> 实例 3389），不开任何公网入站
+
+[到 dashboard 连通性 — 实测]
+  TCP 10.162.255.8:80   -> True
+  TCP 10.162.255.8:3500 -> True
+  GET http://10.162.255.8:3500/api/repos -> 返回数据（从 RDS 读出）
+
+[插件] git-ai.git-ai-kiro-0.2.3  已安装
+
+------------------------------------------------------------------------
+[关键过程：第一次失败 → 排查 → 修复 → 第二次成功]
+
+现象：Kiro 写了代码也 commit 了，但 dashboard 没更新。
+
+排查（全部经 SSM 远程在两台机器上完成）：
+  1) 服务端 ingest 日志：只有本机的 userSync 上报，无任何 stats 上报
+       [ingest] userSync: user=Unknown ip=10.162.255.159 hostname=EC2AMAZ-INC6DOR
+     => 插件活着、网络通，但 commit 统计从未发出
+  2) 定位仓库：C:\workspace\calculator（Kiro 工作区）
+  3) 检查仓库 .git/hooks/post-commit：★缺失★  <-- 根本原因
+     => 第一次 commit (fd25b0a) 时钩子未装，commit 不触发统计
+
+根因：插件在“激活时”给已打开的 git 仓库装 post-commit 钩子。
+      若先启动插件、后 git init / 后打开项目，则钩子未被安装。
+
+修复：在 Kiro 中执行 “Developer: Reload Window”（或重启 Kiro），
+      插件重新扫描并补装 post-commit 钩子；随后再 commit 一次。
+
+------------------------------------------------------------------------
+[第二次 commit — 成功，落库 RDS]
+
+服务端 ingest 日志：
+  Jun 30 05:43:00 [ingest] Saved commit stats: repo=calculator branch=master commit=db6366cf user=wzptest
+
+RDS commits 表（calculator）：1 行
+  commit_sha db6366cf990999d50a7532d02b61c4ff8baecb67
+  user       wzptest <wzptest@amazon.com>
+  ai_additions=20  human_additions=0  mixed_additions=0  ai_accepted=20
+  git_diff_added_lines=20  git_diff_deleted_lines=10  ai_deletions=10  human_deletions=0
+  total_ai_additions=60  total_ai_deletions=30
+
+by_tool_model: kiro::kiro-ai  (ai_additions=20)
+ai_ratio_history: ai_ratio = 1.0  (=(20-0)/(20+0-0))
+
+看板 /api/repos/calculator/aggregate 与上述 RDS 数据完全一致。
+
+------------------------------------------------------------------------
+[指标解读 / 两次提交最终效果]
+
+* 最终效果 = 只统计了第二次 commit。第一次（钩子未装）永久丢失，
+  不会自动补报，也不会与第二次累加。机制本质：只统计“启用监控后”的 commit。
+
+* ai_additions(20) = 最终留在 commit 里、归因为 AI 的净行数
+* total_ai_additions(60) = AI 整个编码过程的累计写入动作（含被改写/删除的过程量）
+  -> 二者不等是预期：区分“过程努力”与“最终归因”
+* AI 占比 = (ai - mixed*0.5)/(ai + human - mixed) = 1.0（100% AI）
+* 数据库 / 聚合 API / tool_model 三处一致，指标自洽准确。
+
+------------------------------------------------------------------------
+[追加] 数据源自证 + 用户管理(IdC)修复  (2026-06-30)
+
+数据确实来自 RDS（决定性实验）：
+  - 直接对 RDS 执行 UPDATE commits SET commit_msg='PROOF-FROM-RDS-xxxx'（绕过应用）
+  - 未重启服务，立即 GET /api/repos/calculator → commit_msg 返回该标记值
+  - 证明 dashboard 实时读 RDS；本地无 stats.db、node_modules 无 better-sqlite3
+  - 验证后已还原 commit_msg
+
+用户管理显示真实 IdC 用户（修复权限）：
+  - 现象：用户管理全是 Unknown / status=UNKNOWN（不真实）
+  - 根因：Dashboard EC2 实例角色 AmazonSSMRoleForInstancesQuickSetup
+          缺 identitystore:ListUsers → /api/users 调 IdC 被拒 → 降级仅显示本地用户
+  - 修复：给角色加内联策略 kiro-idc-readonly
+          (identitystore:ListUsers, identitystore:DescribeUser, cloudtrail:LookupEvents)
+  - 结果：/api/users 立即拉到 IdC 真实用户
+          q-developer (display=wzp, ENABLED)
+          wzp2 (display=zipeng2 wang, ENABLED)
+  - 已清理早期测试残留用户 Unknown / deployer@corp.example
+  - 已落入交付：两个 CFN 模板的实例角色含该权限；03-ec2.sh 复用现成角色时自动补该策略

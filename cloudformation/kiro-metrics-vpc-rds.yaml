@@ -1,0 +1,274 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Kiro Coding Metrics Collector — 在模拟客户 VPC (10.162.255.0/24) 的私有子网中部署
+  Dashboard (EC2) + RDS PostgreSQL。EC2 经 SSM 管理（无需 SSH/堡垒机），RDS 仅私有子网可达。
+  这是与配套 shell 脚本 (01-network/02-rds/03-ec2) 等价的声明式 IaC 版本。
+
+# ------------------------------------------------------------
+# 参数
+# ------------------------------------------------------------
+Parameters:
+  DBUsername:
+    Type: String
+    Default: kiroadmin
+    Description: RDS 主用户名
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: RDS 主用户口令（8+ 位，避免 /@" 空格 等特殊字符）
+  DBName:
+    Type: String
+    Default: kiro
+  IdentityStoreId:
+    Type: String
+    Default: ""
+    Description: （可选）IAM Identity Center Identity Store ID，用于 /api/users 用户同步
+  DeployBucket:
+    Type: String
+    Description: 存放 kiro-dashboard-src.tgz 的 S3 桶名（EC2 将从此拉取代码）
+  InstanceType:
+    Type: String
+    Default: t3.small
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Mappings: {}
+
+Resources:
+  # ---------------- VPC + 子网（模拟客户布局）----------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.162.255.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: kiro-vpc }, { Key: Project, Value: kiro-metrics-rds }]
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.162.255.0/26          # kiro-ai-us-east-1 私有子网 A
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags: [{ Key: Name, Value: kiro-ai-us-east-1-a }, { Key: Project, Value: kiro-metrics-rds }]
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.162.255.64/26         # kiro-ai-us-east-1 私有子网 B
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags: [{ Key: Name, Value: kiro-ai-us-east-1-b }, { Key: Project, Value: kiro-metrics-rds }]
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.162.255.128/26        # 公有子网
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: kiro-public }, { Key: Project, Value: kiro-metrics-rds }]
+
+  # ---------------- IGW + NAT ----------------
+  Igw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: kiro-igw }, { Key: Project, Value: kiro-metrics-rds }]
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref Igw }
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties: { Domain: vpc }
+  NatGw:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags: [{ Key: Name, Value: kiro-nat }, { Key: Project, Value: kiro-metrics-rds }]
+
+  # ---------------- 路由表 ----------------
+  PublicRt:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc, Tags: [{ Key: Name, Value: kiro-rt-public }] }
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref PublicRt
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+  PublicAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { RouteTableId: !Ref PublicRt, SubnetId: !Ref PublicSubnet }
+
+  PrivateRt:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc, Tags: [{ Key: Name, Value: kiro-rt-private }] }
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRt
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGw
+  PrivateAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { RouteTableId: !Ref PrivateRt, SubnetId: !Ref PrivateSubnetA }
+  PrivateAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { RouteTableId: !Ref PrivateRt, SubnetId: !Ref PrivateSubnetB }
+
+  # ---------------- 安全组 ----------------
+  AppSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Kiro dashboard app SG
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80,   ToPort: 80,   CidrIp: 10.162.255.0/24 }
+        - { IpProtocol: tcp, FromPort: 3500, ToPort: 3500, CidrIp: 10.162.255.0/24 }
+      Tags: [{ Key: Name, Value: kiro-app-sg }, { Key: Project, Value: kiro-metrics-rds }]
+
+  DbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Kiro RDS SG
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: kiro-db-sg }, { Key: Project, Value: kiro-metrics-rds }]
+  DbSgIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DbSg
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref AppSg   # 仅 app SG 可访问 5432
+
+  # ---------------- RDS ----------------
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Kiro metrics private subnets
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      Tags: [{ Key: Project, Value: kiro-metrics-rds }]
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: kiro-metrics-pg
+      Engine: postgres
+      EngineVersion: "16.14"
+      DBInstanceClass: db.t4g.micro
+      AllocatedStorage: "20"
+      StorageType: gp3
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSg]
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 1
+      Tags: [{ Key: Project, Value: kiro-metrics-rds }]
+
+  # ---------------- EC2 实例角色（SSM + 读取部署桶）----------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: sts:AssumeRole }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: read-deploy-bucket-and-idc
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub "arn:aws:s3:::${DeployBucket}/*"
+              # Dashboard 应用运行所需（对应代码里全部 AWS 调用）：
+              #   identitystore:ListUsers/DescribeUser（用户同步）
+              #   cloudtrail:LookupEvents（session 同步）
+              #   s3:GetObject/ListBucket（credit 同步读 Kiro 活动报告桶 + 部署桶）
+              - Effect: Allow
+                Action: [identitystore:ListUsers, identitystore:DescribeUser, cloudtrail:LookupEvents, s3:GetObject, s3:ListBucket]
+                Resource: "*"
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  # ---------------- EC2 实例（私有子网 A）----------------
+  DashboardInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref PrivateSubnetA
+      SecurityGroupIds: [!Ref AppSg]
+      IamInstanceProfile: !Ref InstanceProfile
+      Tags: [{ Key: Name, Value: kiro-dashboard-ec2 }, { Key: Project, Value: kiro-metrics-rds }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+          dnf install -y nodejs gcc-c++ make
+          mkdir -p /opt/kiro && cd /opt/kiro
+          aws s3 cp s3://${DeployBucket}/kiro-dashboard-src.tgz ./src.tgz --region ${AWS::Region}
+          tar -xzf src.tgz
+          cd /opt/kiro/kiro-dashboard
+          npm install --omit=dev
+          cat > .env <<ENV
+          DB_HOST=${Database.Endpoint.Address}
+          DB_PORT=${Database.Endpoint.Port}
+          DB_NAME=${DBName}
+          DB_USER=${DBUsername}
+          DB_PASSWORD=${DBPassword}
+          DB_SSL=require
+          AWS_REGION=${AWS::Region}
+          IDENTITY_STORE_ID=${IdentityStoreId}
+          INGEST_PORT=80
+          DASHBOARD_PORT=3500
+          ENV
+          chmod 600 .env
+          cat > /etc/systemd/system/kiro-dashboard.service <<UNIT
+          [Unit]
+          Description=Kiro Coding Metrics Dashboard
+          After=network-online.target
+          Wants=network-online.target
+          [Service]
+          Type=simple
+          WorkingDirectory=/opt/kiro/kiro-dashboard
+          ExecStart=/usr/bin/node /opt/kiro/kiro-dashboard/src/main.js
+          Restart=always
+          RestartSec=5
+          User=root
+          AmbientCapabilities=CAP_NET_BIND_SERVICE
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          systemctl daemon-reload
+          systemctl enable --now kiro-dashboard
+
+# ------------------------------------------------------------
+# 输出
+# ------------------------------------------------------------
+Outputs:
+  VpcId: { Value: !Ref Vpc }
+  PrivateSubnetA: { Value: !Ref PrivateSubnetA }
+  PrivateSubnetB: { Value: !Ref PrivateSubnetB }
+  RdsEndpoint: { Value: !GetAtt Database.Endpoint.Address }
+  Ec2InstanceId: { Value: !Ref DashboardInstance }
+  Ec2PrivateIp:
+    Value: !GetAtt DashboardInstance.PrivateIp
+    Description: 把此私有 IP 填入插件 apiConfig.ts 的 STATS_BASE_URL (http://<ip>)

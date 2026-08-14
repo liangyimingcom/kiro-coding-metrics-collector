@@ -1,0 +1,36 @@
+Kiro Coding Metrics Collector — RDS 迁移 & VPC 私有子网部署 端到端验证证据
+========================================================================
+账号: 774868049561   区域: us-east-1   日期: 2026-06-29
+
+[网络] 模拟客户 VPC 布局
+  VPC            vpc-07f349dd936edd3fe   10.162.255.0/24
+  私有子网A      subnet-091a5de35c79888a2 10.162.255.0/26   us-east-1a  kiro-ai-us-east-1-a
+  私有子网B      subnet-0778a7965cd7cb237 10.162.255.64/26  us-east-1b  kiro-ai-us-east-1-b
+  公有子网       subnet-0d60542bfdbdc5254 10.162.255.128/26 us-east-1a
+  NAT 网关       nat-0978477290b3005d8 (公有子网, 供私有子网出网)
+  app SG         sg-01490fbbf142b064d (80/3500 来自 VPC 内)
+  db  SG         sg-0b482a22704b1f47b (5432 仅来自 app SG)
+
+[RDS] PostgreSQL 16.14  db.t4g.micro  私有子网, 非公网可达
+  kiro-metrics-pg.csc7vhhc35lz.us-east-1.rds.amazonaws.com:5432  db=kiro
+
+[EC2] AL2023  t3.small  私有子网A  私有IP 10.162.255.8  (SSM 管理, 无公网IP)
+  systemd: kiro-dashboard.service = active
+  ingest:80  dashboard:3500
+
+[端到端结果]
+  POST /api/v1/stats     -> {"status":"ok"}   (落库 RDS)
+  POST /api/v1/userSync  -> {"status":"ok"}   (落库 RDS kiro_user/plugins)
+  GET  /api/repos                -> 正确聚合
+  GET  /api/repos/vpc-demo/aggregate    -> totals/by_user/by_tool_model 正确
+  GET  /api/repos/vpc-demo/ai-ratio-history -> 0.7105, 0.5  (公式校验通过)
+  GET  /api/users        -> HTTP 200 (IdC 缺失时降级仅显示本地用户)
+
+[直接查 RDS 校验 (绕过应用, node-pg 直连)]
+  commits:          2 行 (Deployer/ec2sha001, Bob/ec2sha002)
+  ai_ratio_history: 2 行
+  kiro_user:        deployer@corp.example credits={"2026-06-29":7.5} plugin_added=1
+  plugins:          dev-laptop-01 / deployer@corp.example / 10.162.255.50
+
+[插件] git-ai-kiro-0.2.3-rds.vsix
+  apiConfig STATS_BASE_URL = http://10.162.255.8 (EC2 私有IP, 端口80)
