@@ -10,7 +10,7 @@ exports.USER_SYNC_URL = exports.STATS_URL = exports.USER_SYNC_API_PATH = exports
  *
  * 如需改为内网 ALB / 私有 DNS，仅需替换此处的 STATS_BASE_URL 并重新打包。
  */
-exports.STATS_BASE_URL = "http://10.162.255.8";
+exports.STATS_BASE_URL = "http://10.162.255.100";
 exports.STATS_API_PATH = "/api/v1/stats";
 exports.USER_SYNC_API_PATH = "/api/v1/userSync";
 exports.STATS_URL = exports.STATS_BASE_URL + exports.STATS_API_PATH;
