@@ -224,7 +224,7 @@
           html += '<div class="section-title">按开发者</div>';
           html += '<table><tr><th>用户</th><th>人类行</th><th>AI 行</th><th>混合</th><th>AI 占比</th><th>提交数</th><th>等待时间</th></tr>';
           for (const key of userKeys) {
-            const u = users[key], name = u.user_name || u.user_email || key;
+            const u = users[key], name = u.display_name || u.user_name || u.user_email || key;
             const uT = (u.human_additions||0) + (u.ai_additions||0) - (u.mixed_additions||0);
             const uAiContrib = (u.ai_additions||0) - (u.mixed_additions||0) * 0.5;
             const uP = uT > 0 ? (uAiContrib / uT * 100).toFixed(1) + "%" : "-";
@@ -243,7 +243,7 @@
             const msg = r.commit_msg || "";
             // 截断超过 80 字符的 commit message，鼠标悬停显示完整内容
             const msgShort = msg.length > 80 ? msg.slice(0, 80) + "…" : msg;
-            html += `<tr><td>${escapeHtml(r.reported_at ? new Date(r.reported_at).toLocaleString("zh-CN") : "-")}</td><td>${escapeHtml(r.user_name||"-")}</td><td>${escapeHtml((r.commit_sha||"").slice(0,8))}</td><td title="${escapeHtml(msg)}">${escapeHtml(msgShort)}</td><td>${escapeHtml(cs.human_additions||0)}</td><td>${escapeHtml(cs.ai_additions||0)}</td><td>${escapeHtml(rP)}</td></tr>`;
+            html += `<tr><td>${escapeHtml(r.reported_at ? new Date(r.reported_at).toLocaleString("zh-CN") : "-")}</td><td>${escapeHtml(r.display_name || r.user_name||"-")}</td><td>${escapeHtml((r.commit_sha||"").slice(0,8))}</td><td title="${escapeHtml(msg)}">${escapeHtml(msgShort)}</td><td>${escapeHtml(cs.human_additions||0)}</td><td>${escapeHtml(cs.ai_additions||0)}</td><td>${escapeHtml(rP)}</td></tr>`;
           }
           html += '</table>';
         }

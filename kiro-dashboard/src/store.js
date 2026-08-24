@@ -161,6 +161,7 @@ async function init() {
   await pool.query("ALTER TABLE commits ADD COLUMN IF NOT EXISTS human_deletions INTEGER DEFAULT 0");
   await pool.query("ALTER TABLE commits ADD COLUMN IF NOT EXISTS commit_msg TEXT DEFAULT ''");
   await pool.query("ALTER TABLE kiro_user ADD COLUMN IF NOT EXISTS user_id TEXT DEFAULT ''");
+  await pool.query("ALTER TABLE kiro_user ADD COLUMN IF NOT EXISTS display_name TEXT DEFAULT ''");
   await pool.query("ALTER TABLE kiro_user ADD COLUMN IF NOT EXISTS plugin_added INTEGER DEFAULT 0");
   try {
     await backfillAiRatioHistory();
@@ -324,7 +325,10 @@ async function getRepoStats(repoName) {
   try {
     await ensureReady();
     const commitsRes = await pool.query(
-      "SELECT * FROM commits WHERE repo_name = $1 ORDER BY reported_at DESC",
+      `SELECT c.*, COALESCE(k.display_name, '') AS display_name
+       FROM commits c
+       LEFT JOIN kiro_user k ON LOWER(c.user_email) = LOWER(k.user_name)
+       WHERE c.repo_name = $1 ORDER BY c.reported_at DESC`,
       [repoName]
     );
     const commits = commitsRes.rows;
@@ -359,6 +363,7 @@ async function getRepoStats(repoName) {
       machine_id: row.machine_id,
       user_name: row.user_name,
       user_email: row.user_email,
+      display_name: row.display_name || "",
       reported_at: row.reported_at,
       commit_stats: {
         human_additions: row.human_additions,
@@ -414,19 +419,23 @@ async function aggregateRepoStats(repoName) {
     const latestRow = latestRes.rows[0];
 
     // 按用户聚合：NULLIF 把空串当 NULL，匹配原 JS 的 || 逻辑
+    // LEFT JOIN kiro_user 获取 display_name（IdC 中文全名）
     const userRes = await pool.query(
       `SELECT
-         COALESCE(NULLIF(user_email, ''), NULLIF(user_name, ''), 'anonymous') AS user_key,
-         COALESCE(MAX(user_name), '') AS user_name,
-         COALESCE(MAX(user_email), '') AS user_email,
-         COALESCE(SUM(human_additions), 0) AS human_additions,
-         COALESCE(SUM(ai_additions), 0) AS ai_additions,
-         COALESCE(SUM(mixed_additions), 0) AS mixed_additions,
-         COALESCE(SUM(ai_accepted), 0) AS ai_accepted,
-         COALESCE(SUM(git_diff_added_lines), 0) AS git_diff_added_lines,
+         COALESCE(NULLIF(c.user_email, ''), NULLIF(c.user_name, ''), 'anonymous') AS user_key,
+         COALESCE(MAX(c.user_name), '') AS user_name,
+         COALESCE(MAX(c.user_email), '') AS user_email,
+         COALESCE(MAX(k.display_name), '') AS display_name,
+         COALESCE(SUM(c.human_additions), 0) AS human_additions,
+         COALESCE(SUM(c.ai_additions), 0) AS ai_additions,
+         COALESCE(SUM(c.mixed_additions), 0) AS mixed_additions,
+         COALESCE(SUM(c.ai_accepted), 0) AS ai_accepted,
+         COALESCE(SUM(c.git_diff_added_lines), 0) AS git_diff_added_lines,
          COUNT(*) AS commit_count,
-         COALESCE(SUM(time_waiting_for_ai), 0) AS time_waiting_for_ai
-       FROM commits WHERE repo_name = $1
+         COALESCE(SUM(c.time_waiting_for_ai), 0) AS time_waiting_for_ai
+       FROM commits c
+       LEFT JOIN kiro_user k ON LOWER(c.user_email) = LOWER(k.user_name)
+       WHERE c.repo_name = $1
        GROUP BY user_key`,
       [repoName]
     );
@@ -436,6 +445,7 @@ async function aggregateRepoStats(repoName) {
       byUser[row.user_key] = {
         user_name: row.user_name,
         user_email: row.user_email,
+        display_name: row.display_name,
         human_additions: row.human_additions,
         ai_additions: row.ai_additions,
         mixed_additions: row.mixed_additions,
@@ -602,7 +612,8 @@ async function getAllUsers() {
 }
 
 /**
- * 从 IAM Identity Center 用户列表同步到本地表。只插入不存在的（ON CONFLICT DO NOTHING）。
+ * 从 IAM Identity Center 用户列表同步到本地表。
+ * 冲突时更新 user_id 和 display_name（保证 IdC 的最新 displayName 能覆盖到本地）。
  */
 async function syncIdCUsersToLocal(idcUsers) {
   await ensureReady();
@@ -612,10 +623,13 @@ async function syncIdCUsersToLocal(idcUsers) {
     await client.query("BEGIN");
     for (const u of idcUsers) {
       await client.query(
-        `INSERT INTO kiro_user (user_name, user_id, created_at, user_ip, credit_used, updated_at, plugin_added)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)
-         ON CONFLICT (user_name) DO NOTHING`,
-        [u.userName, u.userId, now, "", "{}", now, 0]
+        `INSERT INTO kiro_user (user_name, user_id, display_name, created_at, user_ip, credit_used, updated_at, plugin_added)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (user_name) DO UPDATE SET
+           user_id = EXCLUDED.user_id,
+           display_name = EXCLUDED.display_name,
+           updated_at = EXCLUDED.updated_at`,
+        [u.userName, u.userId, u.displayName || "", now, "", "{}", now, 0]
       );
     }
     await client.query("COMMIT");

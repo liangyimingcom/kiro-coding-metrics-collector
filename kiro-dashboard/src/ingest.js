@@ -55,6 +55,27 @@ async function resolveEmailByUserId(rawUserId) {
   return u?.userName || "";
 }
 
+/**
+ * 规范化 payload 的 user_email：
+ * 策略1：有 user_id → 通过 IdC 解析权威 email 覆盖 user_email（解决个人邮箱无法 JOIN 的问题）
+ * 策略2：user_email 已经是企业邮箱 → 保持不变
+ * 策略3：兜底 → 保留原始值
+ */
+async function normalizeUserIdentity(payload) {
+  if (payload.user_id) {
+    try {
+      const resolved = await resolveEmailByUserId(payload.user_id);
+      if (resolved) {
+        payload.user_email = resolved;
+        return;
+      }
+    } catch (err) {
+      console.error(`[ingest] normalizeUserIdentity: failed to resolve user_id=${payload.user_id}: ${err.message}`);
+    }
+  }
+  // 策略2/3：保留原始 user_email 不变
+}
+
 function timestamp() {
   return new Date().toISOString();
 }
@@ -159,6 +180,9 @@ const server = http.createServer(async (req, res) => {
         remoteAddress: req.socket?.remoteAddress,
         idempotencyKey: idempotencyKey || undefined,
       });
+
+      // 规范化 user_email：如果插件上报了 user_id，通过 IdC 解析权威 email 覆盖
+      await normalizeUserIdentity(payload);
 
       await saveStats(payload);
 

@@ -122,7 +122,7 @@ function resolveUserName(rawUserId, userIdMap) {
   }
 
   console.warn(`[creditSync] Cannot resolve UserId: ${rawUserId} (userId=${userId} not found in IdC)`);
-  return rawUserId; // 无法解析时返回原始值
+  return ""; // 无法解析时返回空串，调用方会跳过
 }
 
 /**
