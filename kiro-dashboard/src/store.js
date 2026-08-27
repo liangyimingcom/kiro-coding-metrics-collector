@@ -68,6 +68,8 @@ const SCHEMA_SQL = `
     machine_id TEXT,
     user_name TEXT,
     user_email TEXT,
+    idc_user_name TEXT DEFAULT '',
+    idc_user_id TEXT DEFAULT '',
     reported_at TEXT,
     commit_msg TEXT DEFAULT '',
     human_additions INTEGER DEFAULT 0,
@@ -123,6 +125,7 @@ const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS kiro_user (
     user_name      TEXT PRIMARY KEY,
     user_id        TEXT DEFAULT '',
+    display_name   TEXT DEFAULT '',
     created_at     TEXT NOT NULL,
     user_ip        TEXT DEFAULT '',
     credit_used    TEXT DEFAULT '{}',
@@ -146,6 +149,43 @@ const SCHEMA_SQL = `
   CREATE INDEX IF NOT EXISTS idx_plugins_user_name ON plugins(user_name);
 `;
 
+/**
+ * commits → kiro_user.display_name 的关联片段（getRepoStats / aggregateRepoStats 共用一份，
+ * 避免两处写法漂移导致同一弹窗里两个数字对不上）。
+ *
+ * 两个要点：
+ * 1. 子查询按 LOWER(user_name) 先 GROUP BY 收敛成一对一。直接
+ *    `JOIN kiro_user ON LOWER(c.user_email)=LOWER(k.user_name)` 在存在大小写重复行时
+ *    会让每条 commit 匹配多行 —— 明细行重复、by_user 的 COUNT/SUM 成倍放大，
+ *    而 totals 查询没有 JOIN 不放大，同屏两个数字直接矛盾。
+ * 2. 关联键先试 idc_user_name（IdC 权威标识，由 ingest 旁路写入），**没命中再试**
+ *    user_email。既能命中"IdC UserName 不是邮箱"的环境，又不必改写 commits.user_email
+ *    （改写会让同一个人在升级前后分裂成两个 user_key，且回滚代码追不回来）。
+ *
+ *    这里必须是**两级回退**（两个 LEFT JOIN + COALESCE），不能写成
+ *    `ON k.lname = LOWER(COALESCE(NULLIF(c.idc_user_name,''), c.user_email))`。
+ *    后者是"优先"而不是"都试"：idc_user_name 一旦非空就只拿它去匹配，匹配不上就是空，
+ *    不会再回落到邮箱。实测（本机 PG 18.6，TEMP 表 + ROLLBACK）：kiro_user 里只有
+ *    ('zhang.san@haier.com','张三')，两条 commit 的 user_email 都是它，其中一条
+ *    idc_user_name='A1008803'（IdC 用户已删/改名，或运维按建议合并重复行时删掉了那一行）
+ *      单级 COALESCE 写法 → new-stale-idc: ""      old-no-idc: "张三"
+ *      两级回退写法       → new-stale-idc: "张三"  old-no-idc: "张三"
+ *    也就是说单级写法下"升级后新落的行反而比升级前更差"：本来靠邮箱能显示的中文名变空。
+ *    两个 LEFT JOIN 都对着已收敛成一对一的子查询，所以不会放大行数（实测仍是 2 行）。
+ */
+const DISPLAY_NAME_SRC = `
+    SELECT LOWER(user_name) AS lname, MAX(NULLIF(display_name, '')) AS display_name
+    FROM kiro_user
+    WHERE COALESCE(user_name, '') <> ''
+    GROUP BY LOWER(user_name)
+`;
+const DISPLAY_NAME_JOIN = `
+  LEFT JOIN (${DISPLAY_NAME_SRC}) ki ON ki.lname = LOWER(NULLIF(c.idc_user_name, ''))
+  LEFT JOIN (${DISPLAY_NAME_SRC}) ke ON ke.lname = LOWER(NULLIF(c.user_email, ''))
+`;
+/** 与 DISPLAY_NAME_JOIN 配套的取值表达式：先 IdC 标识、再邮箱、都没有则空串。 */
+const DISPLAY_NAME_EXPR = `COALESCE(NULLIF(ki.display_name, ''), NULLIF(ke.display_name, ''), '')`;
+
 let readyPromise = null;
 
 /** 幂等初始化：建表 + 列迁移 + 回填 ai_ratio_history。首次被任意公共函数触发。 */
@@ -155,20 +195,78 @@ function ensureReady() {
 }
 
 async function init() {
-  await pool.query(SCHEMA_SQL);
-  // 兼容旧库的幂等列补齐（新库已含，这些是 no-op）
-  await pool.query("ALTER TABLE commits ADD COLUMN IF NOT EXISTS ai_deletions INTEGER DEFAULT 0");
-  await pool.query("ALTER TABLE commits ADD COLUMN IF NOT EXISTS human_deletions INTEGER DEFAULT 0");
-  await pool.query("ALTER TABLE commits ADD COLUMN IF NOT EXISTS commit_msg TEXT DEFAULT ''");
-  await pool.query("ALTER TABLE kiro_user ADD COLUMN IF NOT EXISTS user_id TEXT DEFAULT ''");
-  await pool.query("ALTER TABLE kiro_user ADD COLUMN IF NOT EXISTS display_name TEXT DEFAULT ''");
-  await pool.query("ALTER TABLE kiro_user ADD COLUMN IF NOT EXISTS plugin_added INTEGER DEFAULT 0");
+  // 全部 DDL 走**同一条**连接：lock_timeout 是会话级 GUC，用 pool.query 单发一条
+  // `SET` 只作用于池里随机取到的那条连接，后面的 ALTER 不保证还是它（node-postgres
+  // 取空闲连接"通常"是同一条，但不是契约），而且那条连接归还池后会带着
+  // lock_timeout=10s 去跑业务查询。显式 connect() 才能保证作用域正确、用完复位。
+  const ddl = await pool.connect();
+  try {
+    // DDL 加锁超时：宁可启动失败并留下日志，也不要在 ALTER 上无限等锁——
+    // 那会让进程既不退出也不监听端口，而 systemctl is-active 仍显示 active（假健康）。
+    await ddl.query("SET lock_timeout = '10s'");
+    await ddl.query(SCHEMA_SQL);
+    // 兼容旧库的幂等列补齐（新库已含，这些是 no-op）
+    await ddl.query("ALTER TABLE commits ADD COLUMN IF NOT EXISTS ai_deletions INTEGER DEFAULT 0");
+    await ddl.query("ALTER TABLE commits ADD COLUMN IF NOT EXISTS human_deletions INTEGER DEFAULT 0");
+    await ddl.query("ALTER TABLE commits ADD COLUMN IF NOT EXISTS commit_msg TEXT DEFAULT ''");
+    await ddl.query("ALTER TABLE commits ADD COLUMN IF NOT EXISTS idc_user_name TEXT DEFAULT ''");
+    await ddl.query("ALTER TABLE commits ADD COLUMN IF NOT EXISTS idc_user_id TEXT DEFAULT ''");
+    await ddl.query("ALTER TABLE kiro_user ADD COLUMN IF NOT EXISTS user_id TEXT DEFAULT ''");
+    await ddl.query("ALTER TABLE kiro_user ADD COLUMN IF NOT EXISTS display_name TEXT DEFAULT ''");
+    await ddl.query("ALTER TABLE kiro_user ADD COLUMN IF NOT EXISTS plugin_added INTEGER DEFAULT 0");
+    await ensureLowerNameUniqueIndex(ddl);
+  } finally {
+    // RESET 后再归还，避免这条连接把 lock_timeout 带给后续业务查询。
+    await ddl.query("RESET lock_timeout").catch(() => {});
+    ddl.release();
+  }
   try {
     await backfillAiRatioHistory();
   } catch (err) {
     console.error("backfillAiRatioHistory: failed:", err);
   }
   console.log("[store] PostgreSQL schema ready");
+}
+
+/**
+ * kiro_user.user_name 是大小写敏感的主键，但两个写入源互不协调
+ * （IdC 同步写 UserName 原样大小写；插件 userSync 写 kiro-cli whoami 的邮箱），
+ * 所以 'Zhang.San@x.com' 与 'zhang.san@x.com' 可以合法共存。
+ * display_name 的关联走 LOWER()，这类重复行会让 JOIN 一对多放大统计值。
+ *
+ * 建唯一索引根治。已有脏数据时索引会建失败——此处**不得**让它阻断启动：
+ * 查询侧已用子查询收敛（见 DISPLAY_NAME_JOIN），失败只是少了一层护栏。
+ *
+ * @param {import("pg").PoolClient|import("pg").Pool} db init() 里持有 lock_timeout 的那条连接
+ */
+async function ensureLowerNameUniqueIndex(db = pool) {
+  try {
+    await db.query(
+      "CREATE UNIQUE INDEX IF NOT EXISTS uq_kiro_user_lower_name ON kiro_user (LOWER(user_name))"
+    );
+  } catch (err) {
+    const dupRes = await db.query(
+      `SELECT LOWER(user_name) AS lname, array_agg(user_name) AS variants
+       FROM kiro_user GROUP BY LOWER(user_name) HAVING count(*) > 1`
+    ).catch(() => ({ rows: [] }));
+    console.error(
+      `[store] uq_kiro_user_lower_name 未能创建：${err.message}\n` +
+      `[store] kiro_user 存在大小写重复行 ${dupRes.rows.length} 组，需人工合并后重启：` +
+      dupRes.rows.map((r) => `${r.lname} -> ${JSON.stringify(r.variants)}`).join("; ")
+    );
+  }
+  // 关联键在 commits 侧的支撑索引（表可能很大，用 LOWER 表达式索引匹配查询写法）。
+  // 注意这两条**不是** CONCURRENTLY：commits 是唯一会长到百万行的表，非并发建索引
+  // 要持 SHARE 锁 + 全表扫，期间 ingest 的 INSERT 全部排队，而 main.js 是
+  // await ensureReady() 之后才 require ingest/dashboard → 80/3500 全程不监听。
+  // 因此百万行级的库要在**停服前**手工用 CREATE INDEX CONCURRENTLY 预建
+  // （SQL 见《部署手册》§12.3 的 ⚠️ 说明），预建过之后这里的 IF NOT EXISTS 就是 no-op。
+  await db.query(
+    "CREATE INDEX IF NOT EXISTS idx_commits_user_email_lower ON commits (LOWER(user_email))"
+  ).catch((err) => console.warn(`[store] idx_commits_user_email_lower: ${err.message}`));
+  await db.query(
+    "CREATE INDEX IF NOT EXISTS idx_commits_idc_user_name_lower ON commits (LOWER(idc_user_name))"
+  ).catch((err) => console.warn(`[store] idx_commits_idc_user_name_lower: ${err.message}`));
 }
 
 /**
@@ -260,20 +358,23 @@ async function saveStats(payload) {
     const insRes = await client.query(
       `INSERT INTO commits (
          repo_name, repo_remote_url, branch, commit_sha, machine_id,
-         user_name, user_email, reported_at, commit_msg,
+         user_name, user_email, idc_user_name, reported_at, commit_msg,
          human_additions, ai_additions, mixed_additions,
          ai_accepted, total_ai_additions, total_ai_deletions,
          time_waiting_for_ai, git_diff_added_lines, git_diff_deleted_lines,
-         ai_deletions, human_deletions
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+         ai_deletions, human_deletions, idc_user_id
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
        RETURNING id`,
       [
         p.repo_name, p.repo_remote_url, p.branch, p.commit_sha, p.machine_id,
-        p.user_name, p.user_email, p.reported_at, p.commit_msg || "",
+        p.user_name, p.user_email, p.idc_user_name || "", p.reported_at, p.commit_msg || "",
         cs.human_additions, cs.ai_additions, cs.mixed_additions,
         cs.ai_accepted, cs.total_ai_additions, cs.total_ai_deletions,
         cs.time_waiting_for_ai, cs.git_diff_added_lines, cs.git_diff_deleted_lines,
         cs.ai_deletions || 0, cs.human_deletions || 0,
+        // 原始上报的 user_id 原样落库（解析成功与否都存）。idc_user_name 只是"入库当时"的
+        // 解析结果——若那一刻 IdC 恰好故障，没有这一列这条 commit 就永久失去关联线索。
+        p.user_id || "",
       ]
     );
     const commitId = insRes.rows[0].id;
@@ -325,9 +426,9 @@ async function getRepoStats(repoName) {
   try {
     await ensureReady();
     const commitsRes = await pool.query(
-      `SELECT c.*, COALESCE(k.display_name, '') AS display_name
+      `SELECT c.*, ${DISPLAY_NAME_EXPR} AS display_name
        FROM commits c
-       LEFT JOIN kiro_user k ON LOWER(c.user_email) = LOWER(k.user_name)
+       ${DISPLAY_NAME_JOIN}
        WHERE c.repo_name = $1 ORDER BY c.reported_at DESC`,
       [repoName]
     );
@@ -425,7 +526,7 @@ async function aggregateRepoStats(repoName) {
          COALESCE(NULLIF(c.user_email, ''), NULLIF(c.user_name, ''), 'anonymous') AS user_key,
          COALESCE(MAX(c.user_name), '') AS user_name,
          COALESCE(MAX(c.user_email), '') AS user_email,
-         COALESCE(MAX(k.display_name), '') AS display_name,
+         COALESCE(MAX(${DISPLAY_NAME_EXPR}), '') AS display_name,
          COALESCE(SUM(c.human_additions), 0) AS human_additions,
          COALESCE(SUM(c.ai_additions), 0) AS ai_additions,
          COALESCE(SUM(c.mixed_additions), 0) AS mixed_additions,
@@ -434,7 +535,7 @@ async function aggregateRepoStats(repoName) {
          COUNT(*) AS commit_count,
          COALESCE(SUM(c.time_waiting_for_ai), 0) AS time_waiting_for_ai
        FROM commits c
-       LEFT JOIN kiro_user k ON LOWER(c.user_email) = LOWER(k.user_name)
+       ${DISPLAY_NAME_JOIN}
        WHERE c.repo_name = $1
        GROUP BY user_key`,
       [repoName]
@@ -601,6 +702,31 @@ async function getUser(userName) {
   return row ? { ...row, credit_used: safeParseJson(row.credit_used), plugin_added: !!row.plugin_added } : null;
 }
 
+/**
+ * 按 LOWER(user_name) 查用户（大小写不敏感）。
+ *
+ * 为什么必须有这个函数：唯一索引 uq_kiro_user_lower_name 建的是 LOWER(user_name)，
+ * 而写入路径原来用的是 `ON CONFLICT (user_name)` / `WHERE user_name = $1`（精确大小写）。
+ * 两者对不上时，只要送进来的 user_name 与库里已有行只差大小写，
+ * 就会绕过 ON CONFLICT 直接撞上 LOWER 唯一索引 → 抛 23505 → 整个写入失败。
+ * 实测（RDS PostgreSQL 16.14）：库里有 zhang.san@haier.com，
+ * 送 ZHANG.SAN@haier.com 进来时 syncIdCUsersToLocal 与 userSync 双双抛
+ * `duplicate key value violates unique constraint "uq_kiro_user_lower_name"`。
+ *
+ * 存在重复行（唯一索引没建上）时取哪一行是确定的：先 plugin_added 再 updated_at，
+ * 即"信息更全、更近活跃"的那行，避免每次调用挑到不同行造成写入漂移。
+ */
+async function getUserCaseInsensitive(userName) {
+  await ensureReady();
+  const r = await pool.query(
+    `SELECT * FROM kiro_user WHERE LOWER(user_name) = LOWER($1)
+     ORDER BY plugin_added DESC, updated_at DESC LIMIT 1`,
+    [userName]
+  );
+  const row = r.rows[0];
+  return row ? { ...row, credit_used: safeParseJson(row.credit_used), plugin_added: !!row.plugin_added } : null;
+}
+
 async function getAllUsers() {
   await ensureReady();
   const r = await pool.query("SELECT * FROM kiro_user ORDER BY updated_at DESC");
@@ -614,23 +740,66 @@ async function getAllUsers() {
 /**
  * 从 IAM Identity Center 用户列表同步到本地表。
  * 冲突时更新 user_id 和 display_name（保证 IdC 的最新 displayName 能覆盖到本地）。
+ *
+ * 关联键按 LOWER(user_name) 匹配，而不是 `ON CONFLICT (user_name)`：
+ * kiro_user 里的行可能是插件 userSync 先建的（大小写取决于插件送什么），
+ * 与 IdC 的规范大小写不一致时，`ON CONFLICT (user_name)` 匹配不上，
+ * 却会撞上 uq_kiro_user_lower_name → 23505 → 整个事务回滚 →
+ * **一行脏数据就能让全表的 display_name 永远同步不进来**（调用方 /api/users 还会把异常吞掉降级）。
+ * 因此改为「按 LOWER 先 UPDATE，确认不存在再 INSERT」，且每个用户套一个 SAVEPOINT，
+ * 单个用户失败只跳过该用户、不牵连整批。
  */
 async function syncIdCUsersToLocal(idcUsers) {
   await ensureReady();
   const now = new Date().toISOString();
   const client = await pool.connect();
+  let updated = 0;
+  let inserted = 0;
+  const failed = [];
   try {
     await client.query("BEGIN");
     for (const u of idcUsers) {
-      await client.query(
-        `INSERT INTO kiro_user (user_name, user_id, display_name, created_at, user_ip, credit_used, updated_at, plugin_added)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         ON CONFLICT (user_name) DO UPDATE SET
-           user_id = EXCLUDED.user_id,
-           display_name = EXCLUDED.display_name,
-           updated_at = EXCLUDED.updated_at`,
-        [u.userName, u.userId, u.displayName || "", now, "", "{}", now, 0]
-      );
+      if (!u.userName) { continue; }
+      await client.query("SAVEPOINT sp_idc_user");
+      try {
+        // updated_at 语义是"最后活跃时间"（getAllUsers 的排序键 + 前端"最后活跃"列的唯一数据源），
+        // 只应由插件 userSync / S3 credit 同步刷新。本函数被 GET /api/users 每次调用，
+        // 若在这里刷 updated_at，全表活跃时间会被抹成页面打开时间且不可恢复。
+        // NULLIF 守卫：IdC 未设 DisplayName 的用户会产出空串，不能用它覆盖已有（含人工回填的）值。
+        // WHERE 守卫：无变化时不写，稳态下写入量为 0，避免每次刷页面产生 N 个死元组 + N 个行锁。
+        const upd = await client.query(
+          `UPDATE kiro_user SET
+             user_id      = COALESCE(NULLIF($2, ''), user_id),
+             display_name = COALESCE(NULLIF($3, ''), display_name)
+           WHERE LOWER(user_name) = LOWER($1)
+             AND (user_id      IS DISTINCT FROM COALESCE(NULLIF($2, ''), user_id)
+               OR display_name IS DISTINCT FROM COALESCE(NULLIF($3, ''), display_name))`,
+          [u.userName, u.userId || "", u.displayName || ""]
+        );
+        if (upd.rowCount > 0) {
+          updated += upd.rowCount;
+        } else {
+          // rowCount=0 有两种成因：① 行不存在 ② 行存在但值完全没变（WHERE 守卫生效）。
+          // 必须区分，否则会对已存在的行重复 INSERT 撞唯一索引。
+          const ex = await client.query(
+            "SELECT 1 FROM kiro_user WHERE LOWER(user_name) = LOWER($1) LIMIT 1",
+            [u.userName]
+          );
+          if (ex.rowCount === 0) {
+            await client.query(
+              `INSERT INTO kiro_user (user_name, user_id, display_name, created_at, user_ip, credit_used, updated_at, plugin_added)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               ON CONFLICT (user_name) DO NOTHING`,
+              [u.userName, u.userId || "", u.displayName || "", now, "", "{}", now, 0]
+            );
+            inserted++;
+          }
+        }
+        await client.query("RELEASE SAVEPOINT sp_idc_user");
+      } catch (e) {
+        await client.query("ROLLBACK TO SAVEPOINT sp_idc_user");
+        failed.push(`${u.userName}(${e.code || e.message})`);
+      }
     }
     await client.query("COMMIT");
   } catch (e) {
@@ -639,7 +808,13 @@ async function syncIdCUsersToLocal(idcUsers) {
   } finally {
     client.release();
   }
-  console.log(`[userManagement] Synced ${idcUsers.length} IdC user(s) to local table`);
+  console.log(
+    `[userManagement] Synced ${idcUsers.length} IdC user(s) to local table` +
+    ` (${inserted} inserted, ${updated} updated)`
+  );
+  if (failed.length) {
+    console.warn(`[userManagement] ${failed.length} IdC user(s) skipped: ${failed.join(", ")}`);
+  }
 }
 
 /**
@@ -649,21 +824,54 @@ async function syncIdCUsersToLocal(idcUsers) {
  */
 async function userSync(payload) {
   await ensureReady();
-  const { user_name, user_ip, credit_used, _overwrite_credits, hostname } = payload;
+  const { user_name, user_id, user_ip, credit_used, _overwrite_credits, hostname } = payload;
   if (!user_name) { throw new Error("user_name is required"); }
 
   const now = new Date().toISOString();
-  const existing = await getUser(user_name);
+  // 大小写不敏感地找已有行：否则「库里是 zhang.san@，插件送 ZHANG.SAN@」会走进 INSERT 分支，
+  // 撞上 uq_kiro_user_lower_name 抛 23505 → ingest 回 HTTP 500 → 该用户的 userSync 永久失败
+  // （连带 user_id 落不了库，工号型账号的中文名链路整条断掉）。实测已复现，见 getUserCaseInsensitive 注释。
+  const existing = await getUserCaseInsensitive(user_name);
+  // 后续所有 UPDATE / plugins 关联都必须用库里那行的**原始大小写**做键，不能用送进来的大小写。
+  const canonicalName = existing ? existing.user_name : user_name;
+  if (existing && existing.user_name !== user_name) {
+    console.warn(
+      `[userManagement] userSync 大小写不一致：送来 "${user_name}"，库里是 "${existing.user_name}"，` +
+      `按库里的行更新（不新建行）`
+    );
+  }
 
   if (!existing) {
     const isPlugin = !_overwrite_credits;
-    await pool.query(
-      `INSERT INTO kiro_user (user_name, user_id, created_at, user_ip, credit_used, updated_at, plugin_added)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
-       ON CONFLICT (user_name) DO NOTHING`,
-      [user_name, "", now, user_ip || "", JSON.stringify(credit_used || {}), now, isPlugin ? 1 : 0]
-    );
-    console.log(`[userManagement] Created user: ${user_name} (source=${isPlugin ? "plugin" : "s3"})`);
+    try {
+      await pool.query(
+        `INSERT INTO kiro_user (user_name, user_id, created_at, user_ip, credit_used, updated_at, plugin_added)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)
+         ON CONFLICT (user_name) DO NOTHING`,
+        // user_id 原样落库。尤其是 user_name="Unknown"（IdC 解析失败）的行：
+        // 上报的 user_id 是这行唯一能对回"是谁"的线索，丢了就永久无法事后补救。
+        [user_name, user_id || "", now, user_ip || "", JSON.stringify(credit_used || {}), now, isPlugin ? 1 : 0]
+      );
+      console.log(`[userManagement] Created user: ${user_name} (source=${isPlugin ? "plugin" : "s3"})`);
+    } catch (err) {
+      // 竞态窗口：上面 getUserCaseInsensitive 查空之后、INSERT 落地之前，
+      // 并发写入者（IdC 同步 / 同一用户的另一台机器）先插入了一个大小写变体。
+      // ON CONFLICT (user_name) 只仲裁主键的精确大小写冲突，撞上
+      // uq_kiro_user_lower_name（LOWER 表达式唯一索引）仍会抛 23505 →
+      // 若不接住，ingest 对插件回 HTTP 500。此处重查一次并按已有行更新收场。
+      if (err.code !== "23505") throw err;
+      const raced = await getUserCaseInsensitive(user_name);
+      if (!raced) throw err;
+      console.warn(
+        `[userManagement] userSync 撞上并发写入的大小写变体（送来 "${user_name}"，库里已是 "${raced.user_name}"），按已有行更新`
+      );
+      await pool.query(
+        `UPDATE kiro_user SET user_ip = $1, updated_at = $2, plugin_added = 1,
+           user_id = COALESCE(NULLIF(user_id, ''), NULLIF($4, ''), '')
+         WHERE user_name = $3`,
+        [user_ip || "", now, raced.user_name, user_id || ""]
+      );
+    }
   } else {
     const existingCredits = existing.credit_used || {};
     const incomingCredits = credit_used || {};
@@ -675,23 +883,27 @@ async function userSync(payload) {
     if (_overwrite_credits) {
       const merged = { ...existingCredits, ...Object.fromEntries(Object.entries(incomingCredits).filter(([, v]) => typeof v === "number")) };
       const trimmed = Object.fromEntries(Object.entries(merged).filter(([d]) => d >= cutoffStr));
-      await pool.query("UPDATE kiro_user SET credit_used = $1 WHERE user_name = $2", [JSON.stringify(trimmed), user_name]);
-      console.log(`[userManagement] Updated credits (s3): ${user_name}`);
+      await pool.query("UPDATE kiro_user SET credit_used = $1 WHERE user_name = $2", [JSON.stringify(trimmed), canonicalName]);
+      console.log(`[userManagement] Updated credits (s3): ${canonicalName}`);
     } else {
       const merged = Object.entries(incomingCredits).reduce((acc, [d, v]) => {
         acc[d] = (acc[d] || 0) + (typeof v === "number" ? v : 0); return acc;
       }, { ...existingCredits });
       const trimmed = Object.fromEntries(Object.entries(merged).filter(([d]) => d >= cutoffStr));
+      // user_id 只补空不覆盖：IdC 同步写入的权威 UUID 不该被插件上报顶掉；
+      // 但行里还是空（如历史遗留的 Unknown 行）时，用上报值补上。
       await pool.query(
-        "UPDATE kiro_user SET user_ip = $1, credit_used = $2, updated_at = $3, plugin_added = $4 WHERE user_name = $5",
-        [user_ip || existing.user_ip || "", JSON.stringify(trimmed), now, 1, user_name]
+        `UPDATE kiro_user SET user_ip = $1, credit_used = $2, updated_at = $3, plugin_added = $4,
+           user_id = COALESCE(NULLIF(user_id, ''), NULLIF($6, ''), '')
+         WHERE user_name = $5`,
+        [user_ip || existing.user_ip || "", JSON.stringify(trimmed), now, 1, canonicalName, user_id || ""]
       );
-      console.log(`[userManagement] Updated user (plugin): ${user_name}`);
+      console.log(`[userManagement] Updated user (plugin): ${canonicalName}`);
     }
   }
 
   if (!_overwrite_credits && hostname) {
-    await upsertPlugin(hostname, user_name, user_ip || "");
+    await upsertPlugin(hostname, canonicalName, user_ip || "");
   }
 }
 
@@ -781,6 +993,7 @@ module.exports = {
   getAiRatioHistory,
   // 用户管理
   getUser,
+  getUserCaseInsensitive,
   getAllUsers,
   userSync,
   syncIdCUsersToLocal,

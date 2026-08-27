@@ -8,7 +8,8 @@
     "start:ingest": "node src/ingest.js",
     "start:dashboard": "node src/dashboard.js",
     "migrate": "node src/migrate.js",
-    "test": "vitest --run"
+    "test": "vitest --run",
+    "test:display-name": "node scripts/verify-display-name.js"
   },
   "engines": {
     "node": ">=20"

@@ -50,6 +50,7 @@ async function syncCreditsFromS3() {
 
   // 构建 userId → userName 映射表，同时同步到本地用户表
   let userIdMap = {};
+  let idcOk = true;
   try {
     const idcUsers = await listIdCUsers();
     await syncIdCUsersToLocal(idcUsers);
@@ -60,13 +61,15 @@ async function syncCreditsFromS3() {
     }
     console.log(`[creditSync] Loaded ${Object.keys(userIdMap).length} IdC user(s) for mapping`);
   } catch (err) {
+    idcOk = false;
     console.error(`[creditSync] Failed to load IdC users: ${err.message}`);
-    // 继续执行，只是无法解析 userId
+    // 继续执行，但解析不出 UserName 的文件不标记为已处理，留给下一轮重试
   }
 
   const prefixes = buildDatePrefixes(30);
   let totalFiles = 0;
   let totalUsers = 0;
+  let totalRetry = 0;
 
   for (const prefix of prefixes) {
     const keys = await listCsvFiles(prefix);
@@ -74,10 +77,15 @@ async function syncCreditsFromS3() {
       if (processedKeys.has(key)) { continue; }
       try {
         const records = await downloadAndParseCsv(key);
+        let unresolved = 0;
         for (const record of records) {
           // 将 CSV 中的 UserId 解析为 UserName
           const userName = resolveUserName(record.rawUserId, userIdMap);
-          if (userName && record.creditsUsed > 0) {
+          if (!userName) {
+            unresolved++;
+            continue;
+          }
+          if (record.creditsUsed > 0) {
             const date = record.date || new Date().toISOString().slice(0, 10);
             await userSync({
               user_name: userName,
@@ -88,15 +96,39 @@ async function syncCreditsFromS3() {
             totalUsers++;
           }
         }
-        processedKeys.add(key);
-        totalFiles++;
+        // 重试口径：只有 IdC 本轮**不可用**（列目录失败/被拒）才保留待重试——
+        // 那是暂时性故障，恢复后重跑才有意义。
+        // 若 IdC 可用但仍有记录解析不出（用户已从 IdC 删除、服务账号等永久性缺席），
+        // 重试永远不会成功：userIdMap 已是完整的新鲜清单。此时必须标记完成，
+        // 否则该 CSV 每小时被无限重跑（30 天窗口内所有含此用户的文件都如此）：
+        // 已解析用户被反复 UPDATE、S3 反复 GET、日志每小时刷 warn，且永无收敛。
+        // 补充：unresolved===0 时无论 IdC 是否可用都算完成——全部记录都已解析入库
+        // （如纯 email 格式的 CSV 根本不需要 IdC），没有任何"重试能补回"的东西。
+        if (idcOk || unresolved === 0) {
+          processedKeys.add(key);
+          totalFiles++;
+          if (unresolved > 0) {
+            console.warn(
+              `[creditSync] ${key}: ${unresolved} 条记录的 UserId 不在当前 IdC 目录中（用户已删除或非 IdC 账号），` +
+              `其 credit 记录被跳过；其余记录已正常入库，本文件标记完成不再重试`
+            );
+          }
+        } else {
+          totalRetry++;
+          console.warn(
+            `[creditSync] ${key}: 本轮 IdC 不可用，本文件保留待下轮重试，未标记为已处理`
+          );
+        }
       } catch (err) {
         console.error(`[creditSync] Failed to process ${key}: ${err.message}`);
       }
     }
   }
 
-  console.log(`[creditSync] Sync complete: ${totalFiles} file(s), ${totalUsers} user record(s) updated`);
+  console.log(
+    `[creditSync] Sync complete: ${totalFiles} file(s), ${totalUsers} user record(s) updated` +
+    (totalRetry > 0 ? `, ${totalRetry} file(s) deferred for retry` : "")
+  );
 }
 
 /**
@@ -122,7 +154,10 @@ function resolveUserName(rawUserId, userIdMap) {
   }
 
   console.warn(`[creditSync] Cannot resolve UserId: ${rawUserId} (userId=${userId} not found in IdC)`);
-  return ""; // 无法解析时返回空串，调用方会跳过
+  // 返回空串（旧版返回 rawUserId，会在 kiro_user 里建出工号之类的垃圾行）。
+  // 调用方跳过该记录**并保留整个 CSV 待下轮重试** —— 不能只跳过不重试，
+  // 否则 IdC 权限缺失期间的 credit 会被永久丢弃。
+  return "";
 }
 
 /**

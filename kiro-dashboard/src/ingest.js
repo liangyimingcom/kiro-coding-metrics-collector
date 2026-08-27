@@ -44,7 +44,10 @@ async function getIdcUserIdMap() {
 
 /**
  * 根据插件上报的 user_id（格式 "d-<storeId>.<uuid>" 或裸 "<uuid>"）
- * 通过 IdC 查询返回 userName（email）。失败返回空串。
+ * 通过 IdC 查询返回 UserName。失败返回空串。
+ *
+ * 注意：IdC 的 UserName **不保证是邮箱**（实测存在 `q-developer`/`wzp2` 这类值），
+ * 所以返回值只能当作 IdC 侧的权威标识用，不能当邮箱写进 user_email。
  */
 async function resolveEmailByUserId(rawUserId) {
   if (!rawUserId) return "";
@@ -56,24 +59,32 @@ async function resolveEmailByUserId(rawUserId) {
 }
 
 /**
- * 规范化 payload 的 user_email：
- * 策略1：有 user_id → 通过 IdC 解析权威 email 覆盖 user_email（解决个人邮箱无法 JOIN 的问题）
- * 策略2：user_email 已经是企业邮箱 → 保持不变
- * 策略3：兜底 → 保留原始值
+ * 补齐 payload 的 IdC 权威标识，用于 display_name 关联。
+ *
+ * 有 user_id 就解析出 IdC UserName，写入**旁路列** idc_user_name；
+ * user_email 一律保持原样。
+ *
+ * 为什么不直接覆盖 user_email：user_email 是 by_user 聚合的分组键
+ * （store.js 的 user_key = COALESCE(NULLIF(user_email,''), ...)）。一旦改写，
+ * 同一个人升级前的提交按 git 邮箱分组、升级后按 IdC UserName 分组 → 报表里出现两行
+ * 且都显示同一个 display_name（看起来像重复用户）；而且这是数据面的原地改写，
+ * 回滚代码也追不回原值。旁路列则历史不断裂、可回填、可对账。
  */
 async function normalizeUserIdentity(payload) {
-  if (payload.user_id) {
-    try {
-      const resolved = await resolveEmailByUserId(payload.user_id);
-      if (resolved) {
-        payload.user_email = resolved;
-        return;
-      }
-    } catch (err) {
-      console.error(`[ingest] normalizeUserIdentity: failed to resolve user_id=${payload.user_id}: ${err.message}`);
+  if (!payload.user_id) return;
+  try {
+    const resolved = await resolveEmailByUserId(payload.user_id);
+    if (resolved) {
+      payload.idc_user_name = resolved;
+      return;
     }
+    console.warn(
+      `[ingest] normalizeUserIdentity: user_id=${payload.user_id} 在 IdC 中无匹配，` +
+      `保留 user_email=${payload.user_email || ""}（display_name 将依赖邮箱二级回退，原始 user_id 已存入 commits.idc_user_id）`
+    );
+  } catch (err) {
+    console.error(`[ingest] normalizeUserIdentity: failed to resolve user_id=${payload.user_id}: ${err.message}`);
   }
-  // 策略2/3：保留原始 user_email 不变
 }
 
 function timestamp() {
