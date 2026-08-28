@@ -9,16 +9,17 @@ Dashboard 使用 SQLite 存储用户相关数据，可切换成MySQL等DB，涉�
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| user_name | TEXT (PK) | 用户 email，主键 |
+| user_name | TEXT (PK) | IdC UserName，主键。**注意：不保证是 email**（实测存在 `q-developer` 这类值）；大小写敏感，另有 `uq_kiro_user_lower_name` 唯一索引约束 `LOWER(user_name)` |
 | user_id | TEXT | IAM Identity Center 的 UserId，用于关联 sessions 表 |
+| display_name | TEXT | IAM Identity Center 的 DisplayName（中文全名）。仅由 IdC 同步写入，且仅在非空时覆盖；用于仓库指标页的开发者显示名 |
 | created_at | TEXT | 记录创建时间 (ISO 8601) |
 | user_ip | TEXT | 最近一次上报的客户端公网 IP |
 | credit_used | TEXT | JSON 格式的按日期 Credit 用量，如 `{"2026-04-25": 5.0}` |
-| updated_at | TEXT | 最后活跃时间（插件 userSync 上报时更新） |
+| updated_at | TEXT | 最后活跃时间。**仅**插件 userSync 上报时更新（S3 Credit 同步只写 `credit_used`，不动此列）；IdC 同步**不得**刷新此列（它是 `getAllUsers` 的排序键与前端"最后活跃"列的唯一数据源） |
 
 数据来源：
-- IAM Identity Center 同步时 INSERT OR IGNORE（只插入新用户）
-- 插件 userSync 上报时更新 
+- IAM Identity Center 同步时 UPSERT：新用户插入；已存在用户**仅在值有变化且新值非空时**更新 `user_id` / `display_name`，不动 `updated_at`
+- 插件 userSync 上报时更新
 - S3 Credit 同步时更新 credit_used
 
 ### sessions 表（SSO 登录会话）

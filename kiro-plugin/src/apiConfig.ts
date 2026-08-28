@@ -7,7 +7,7 @@
  *
  * 如需改为内网 ALB / 私有 DNS，仅需替换此处的 STATS_BASE_URL 并重新打包。
  */
-export const STATS_BASE_URL = "http://10.162.255.100";
+export const STATS_BASE_URL = "http://172.31.13.232";
 export const STATS_API_PATH = "/api/v1/stats";
 export const USER_SYNC_API_PATH = "/api/v1/userSync";
 export const STATS_URL = STATS_BASE_URL + STATS_API_PATH;

@@ -145,6 +145,11 @@ kiro-plugin/support-sources/
 # 注意：kiro-plugin/bin/ 下的二进制是有意提交的（使用者无需装 Rust 即可打包），
 # 因此不在此忽略。用 npm run build:binary 更新后需一并提交。
 
+# 部署脚本的状态文件。★ 必须忽略：02-rds.sh 把 RDS master 明文口令、
+# 04-windows-test-ec2.sh 把 Windows Administrator 明文口令写进 state/*.env，
+# 而这两个脚本又要求在仓库根目录下运行，一个 `git add .` 就会把凭据推上去。
+state/
+
 # 运行时数据与构建产物（不应提交）
 data/
 stats.db
@@ -152,3 +157,8 @@ stats.db-shm
 stats.db-wal
 stats.db*
 # *.vsix  # disabled: need to distribute via git
+
+# 环境定制的插件包(内嵌部署环境私有 IP,严禁入库;通用 vsix 不受影响)
+*-rds.vsix
+# legacy 插件树的构建产物(根目录那条 kiro-plugin/support-sources/ 盖不到这里)
+code/kiro-plugin/support-sources/

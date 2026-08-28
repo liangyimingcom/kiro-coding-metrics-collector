@@ -34,6 +34,8 @@
 | ⑤ 产生数据 | §7 | 用 Kiro AI 写代码→commit→插件上传 |
 | ⑥ 看板查看 | §5 / §7 | 浏览器看 AI 占比、按人/按模型明细 |
 
+> **已经部署过、这次只是升级?** 上面 ①–⑥ 是首次安装的流程,**升级不要重走**——直接看 **[§12 升级已部署的环境](#12-升级已部署的环境只更新云上部分插件不动)**。典型场景(服务端代码更新、插件无变化)只需"换文件 + 重启",停机约 1 分钟,不碰 CloudFormation、不碰数据库、不重发插件。
+
 ---
 
 ## 1. 系统组成与数据流
@@ -411,6 +413,110 @@ aws cloudformation wait stack-delete-complete --stack-name kiro-metrics-rds
 ```bash
 cd scripts && bash 99-teardown.sh        # 或 --yes 跳过确认
 ```
+
+---
+
+## 12. 升级已部署的环境（只更新云上部分,插件不动）
+
+<a id="12-升级已部署的环境只更新云上部分插件不动"></a>
+
+> 适用场景:仓库里的 **dashboard 服务端代码**有更新(修 bug / 加列 / 改查询),而插件上报接口和 Dashboard 地址都没变。
+> 这是最常见的升级形态。**整个过程不碰 CloudFormation、不手工改数据库、不重新生成 VSIX。**
+
+### 12.0 先判断:插件到底要不要动
+
+| 变化 | 插件 | 云上 |
+|---|---|---|
+| 只改了 `code/kiro-dashboard/`(服务端逻辑、表结构、页面) | **不动**——已装的插件继续用 | 按本节升级 |
+| EC2 私有 IP 变了(如换机/前置 ALB) | **要重发**——地址烧死在 VSIX 里,按 §6 重新 build + 全员重装 | 按本节升级 |
+| `kiro-plugin/` 插件代码变了 | 要重发,按 §6 | 视情况 |
+
+### 12.1 升级前(约 2 分钟)
+
+```bash
+# 1) 备份数据库(RDS 手工快照,回滚数据的唯一手段)
+aws rds create-db-snapshot --db-instance-identifier kiro-metrics-pg \
+  --db-snapshot-identifier kiro-before-upgrade-$(date +%Y%m%d)
+
+# 2) 记录当前在跑什么(升级后对比、出问题好回话)
+#    经 SSM 在 EC2 上执行:
+md5sum /opt/kiro/kiro-dashboard/src/*.js
+```
+
+### 12.2 打包新代码并上传(在有仓库的机器上)
+
+```bash
+cd <仓库根目录> && git pull
+tar -czf /tmp/kiro-dashboard-src.tgz -C code \
+  --exclude='node_modules' --exclude='data' --exclude='.env' --exclude='logs' \
+  kiro-dashboard
+# ⚠️ 必须覆盖 S3 上这个【固定文件名】——CFN 的开机脚本认死它。
+#    不覆盖的话,现在升级没问题,但将来 EC2 一旦重建,拉到的是旧代码(隐性回退)。
+aws s3 cp /tmp/kiro-dashboard-src.tgz "s3://$BUCKET/kiro-dashboard-src.tgz"
+```
+
+### 12.3 在 EC2 上执行升级(经 SSM,停机约 1 分钟)
+
+```bash
+set -e                                          # 任一步失败立即停,别带着残缺目录起服务
+systemctl stop kiro-dashboard
+cd /opt/kiro
+# 备份名固定进变量再引用——不要用 kiro-dashboard.bak.* 通配:
+# 第二次升级时会匹配到多个历史备份,cp 直接报错;同一天二次升级还会把新目录嵌进旧备份里。
+BAK="kiro-dashboard.bak.$(date +%Y%m%d-%H%M%S)"
+mv kiro-dashboard "$BAK"                        # 整目录留作回滚
+aws s3 cp "s3://$BUCKET/kiro-dashboard-src.tgz" /tmp/new.tgz && tar -xzf /tmp/new.tgz -C /opt/kiro
+cp "$BAK/.env" kiro-dashboard/.env && chmod 600 kiro-dashboard/.env   # 配置原样保留
+cp -r "$BAK/node_modules" kiro-dashboard/node_modules                 # 依赖没变就直接复用
+systemctl start kiro-dashboard
+echo "本次备份目录: /opt/kiro/$BAK"               # 记下来,12.5 回滚要用
+```
+
+- **依赖**:`package.json` 没变就复用 `node_modules`(本项目至今如此);变了才 `cd /opt/kiro/kiro-dashboard && npm ci --omit=dev`。
+- **表结构不用管**:服务启动时自动补齐新表/新列(全部 `IF NOT EXISTS`,幂等,老数据不动)。**不需要 DBA、不需要手工 SQL。**
+  升级失败重启、连升两次都安全;从任何历史版本的库一步升到最新(补列清单是累积式的)。
+  DDL 带 `lock_timeout=10s`:若升级瞬间数据库恰有长事务占锁,服务会**启动失败并留日志**(systemd 会自动重试),
+  而不是无限等锁装死——看到 `lock timeout` 日志时,等业务事务结束或找个安静时段重启即可。
+- **⚠️ 唯一的例外:`commits` 表已达百万行级时**,新版本若引入了 commits 上的新索引,启动时的
+  `CREATE INDEX`(非并发)会短暂阻塞上报写入。库大的环境请在**停服之前**先手工预建
+  (对本版本是这两条,已建过则启动时自动跳过,预建期间不停服、不锁写):
+  ```sql
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_commits_user_email_lower    ON commits (LOWER(user_email));
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_commits_idc_user_name_lower ON commits (LOWER(idc_user_name));
+  ```
+  几万行以内的库无需理会这条,启动时顺手建完(实测百万行也只是分钟级,只是期间上报排队)。
+
+### 12.4 验证(一分钟)
+
+```bash
+systemctl is-active kiro-dashboard                     # active
+ss -ltn | grep -E ':80 |:3500 '                        # 两个端口都在
+md5sum /opt/kiro/kiro-dashboard/src/*.js               # 与仓库新版一致
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3500/api/repos   # 200
+curl -s http://127.0.0.1:3500/api/users | head -c 200  # 能看到用户与 display_name
+```
+
+### 12.5 回滚(万一)
+
+```bash
+systemctl stop kiro-dashboard
+cd /opt/kiro && rm -rf kiro-dashboard && mv kiro-dashboard.bak.<12.3 打印的那个时间戳> kiro-dashboard
+systemctl start kiro-dashboard
+```
+
+**代码可以随时回滚;数据库不用回滚**——新版本加的列对旧代码完全透明(旧代码不读不写它们)。只有"新版本已写入、旧版本读不懂"的数据变更才需要动快照,本项目目前没有这种变更。
+
+### ⚠️ 12.6 三个必须避开的坑(实测踩过)
+
+1. **不要用 `scripts/remote-deploy.sh` 做升级**——它会**整个重写** `.env`,丢掉 `KIRO_S3_BUCKET`/`KIRO_ACCOUNT_ID` 等配置,导致 credit 同步被静默关闭。它只适合首次部署。
+2. **S3 固定文件名必须覆盖**(12.2 的 ⚠️),否则埋下"实例重建=代码回退"的雷。
+3. **不要重跑 CloudFormation 来"更新代码"**——CFN 只在 EC2 首次开机时拉一次代码,重跑模板不会更新任何已存在机器上的文件。
+4. **升级后"按开发者"里同一人可能出现两行(仅影响升级前就有数据的库)**:旧版本入库时会把
+   `user_email` 改写成 IdC 工号(带 user_id 且解析成功的上报),新版本**不再改写**(原值保留,
+   工号写入独立的 `idc_user_name` 列)。于是同一个人升级前的 commit 以工号为聚合键、升级后的以
+   git 邮箱为聚合键,报表里像两个人(两行显示的**中文名相同**,行数各自正确,只是没合并)。
+   这是修复"不可逆改写原始数据"的正确代价,**不是数据错误**;新数据积累后旧行影响自然稀释。
+   若客户不能接受,合并方案见 `TODO-注意点与已知问题.md` S2 条(需业务拍板,勿自行改数据)。
 
 ---
 

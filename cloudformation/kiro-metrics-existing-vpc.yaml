@@ -96,7 +96,9 @@ Resources:
   DbSubnetGroup:
     Type: AWS::RDS::DBSubnetGroup
     Properties:
-      DBSubnetGroupDescription: Kiro metrics — customer existing private subnets
+      # 必须是纯 ASCII：RDS 会以 "must not contain non-printable control characters"
+      # 拒绝含非 ASCII 字符的描述（原来这里的破折号是 U+2014，导致整个栈创建即回滚）。
+      DBSubnetGroupDescription: Kiro metrics - customer existing private subnets
       SubnetIds: !Ref PrivateSubnetIds
       Tags: [{ Key: Project, Value: kiro-metrics-rds }]
 

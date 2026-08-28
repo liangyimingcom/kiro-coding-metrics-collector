@@ -38,16 +38,22 @@ const server = http.createServer(async (req, res) => {
       // 从本地表读取所有用户（已包含 plugin_added、credit_used 等）
       const users = await getAllUsers();
 
-      // 构建 IdC displayName/status/userId 查找表
+      // 构建 IdC displayName/status/userId 查找表。
+      // 键按 LOWER 归一：kiro_user 里的行可能是插件 userSync 先建的，大小写与 IdC 的
+      // 规范写法不一致（IdC 的 UserName 唯一性本身就是大小写不敏感的，实测建
+      // ZHAO.LIU@ 会被 ConflictException: Duplicate UserName 拒掉）。若这里用精确
+      // 大小写查表，那些行会取不到 idc → Status 列显示 UNKNOWN、session 数按 0 算。
       const idcMap = {};
-      for (const u of idcUsers) { idcMap[u.userName] = u; }
+      for (const u of idcUsers) {
+        if (u.userName) { idcMap[u.userName.toLowerCase()] = u; }
+      }
 
       const cutoff = new Date();
       cutoff.setDate(cutoff.getDate() - 30);
       const cutoffStr = cutoff.toISOString().slice(0, 10);
 
       const result = await Promise.all(users.map(async (u) => {
-        const idc = idcMap[u.user_name] || {};
+        const idc = idcMap[(u.user_name || "").toLowerCase()] || {};
         const creditUsed = u.credit_used || {};
         const totalCredits = Object.entries(creditUsed)
           .filter(([date]) => date >= cutoffStr)
@@ -65,7 +71,9 @@ const server = http.createServer(async (req, res) => {
 
         return {
           userName: u.user_name,
-          displayName: idc.displayName || "",
+          // 优先用本次请求实时拿到的 IdC 值；IdC 不可达时回退到 kiro_user.display_name
+          // （上一次成功同步落的库值）。旧库没有该列时是 undefined，|| 安全。
+          displayName: idc.displayName || u.display_name || "",
           status: idc.status || "UNKNOWN",
           activeSessions,
           activePlugins,
