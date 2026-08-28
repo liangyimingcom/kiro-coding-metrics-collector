@@ -423,6 +423,16 @@ cd scripts && bash 99-teardown.sh        # 或 --yes 跳过确认
 > 适用场景:仓库里的 **dashboard 服务端代码**有更新(修 bug / 加列 / 改查询),而插件上报接口和 Dashboard 地址都没变。
 > 这是最常见的升级形态。**整个过程不碰 CloudFormation、不手工改数据库、不重新生成 VSIX。**
 
+### ⚠️ 12.A 给 AI 助手 / 自动化执行者的硬规则(人来操作也同样适用)
+
+本章节预期会被交给 AI 助手(如 Kiro)照着执行。执行前先读完这五条,**它们的优先级高于"把升级跑完"**:
+
+1. **每个命令块都标注了执行位置**:`【本地】`= 操作者的工作机(有仓库代码的地方);`【EC2】`= 运行 dashboard 的那台服务器(经 SSM 会话或 SSH 登入后执行)。**跑错机器立即停止。**
+2. **每步都写了"预期结果"**。实际输出与预期不符时:**停止,把原始输出完整报告给人,等待指示**。禁止自行"换个方法试试"。
+3. **权限不足(AccessDenied / not authorized)不算失败**——这是预期分支:立即改走 **§12.7 低权限路径**,不要重试、不要尝试提权。
+4. **绝对禁止的动作**(无论哪一步卡住都不构成理由):重跑/更新 CloudFormation 栈;执行 `scripts/remote-deploy.sh`;手工修改 `.env` 的任何一行;对数据库手工执行任何 DDL/UPDATE/DELETE;删除备份目录或 RDS 快照;重启/重建 EC2 实例。
+5. 升级中断在任何一步,系统的安全状态是:**服务停着 + 备份目录完好**。此时正确动作是按 §12.5 回滚,而不是带着半成品目录启动服务。
+
 ### 12.0 先判断:插件到底要不要动
 
 | 变化 | 插件 | 云上 |
@@ -433,17 +443,26 @@ cd scripts && bash 99-teardown.sh        # 或 --yes 跳过确认
 
 ### 12.1 升级前(约 2 分钟)
 
+**【本地】**备份数据库(回滚数据的唯一手段):
+
 ```bash
-# 1) 备份数据库(RDS 手工快照,回滚数据的唯一手段)
 aws rds create-db-snapshot --db-instance-identifier kiro-metrics-pg \
   --db-snapshot-identifier kiro-before-upgrade-$(date +%Y%m%d)
+```
+> 预期:返回 JSON 且 `Status` 为 `creating`。**报 AccessDenied / not authorized → 不要重试,改用 §12.7 第①步的 pg_dump 备份**,然后继续。
 
-# 2) 记录当前在跑什么(升级后对比、出问题好回话)
-#    经 SSM 在 EC2 上执行:
+**【EC2】**记录当前在跑什么(升级后对比、出问题好回话):
+
+```bash
 md5sum /opt/kiro/kiro-dashboard/src/*.js
 ```
+> 预期:输出 12 行 md5。把输出留存。
 
-### 12.2 打包新代码并上传(在有仓库的机器上)
+### 12.2 打包新代码并上传
+
+> **没有 S3 写权限的操作者:跳过整个 12.2,改走 §12.7 第②步(在 EC2 上直接取码),然后从 12.3 的 `systemctl stop` 那行接着执行。**
+
+**【本地】**(有仓库代码的机器):
 
 ```bash
 cd <仓库根目录> && git pull
@@ -455,7 +474,9 @@ tar -czf /tmp/kiro-dashboard-src.tgz -C code \
 aws s3 cp /tmp/kiro-dashboard-src.tgz "s3://$BUCKET/kiro-dashboard-src.tgz"
 ```
 
-### 12.3 在 EC2 上执行升级(经 SSM,停机约 1 分钟)
+### 12.3 执行升级(停机约 1 分钟)
+
+**【EC2】**整段按顺序执行:
 
 ```bash
 set -e                                          # 任一步失败立即停,别带着残缺目录起服务
@@ -488,6 +509,8 @@ echo "本次备份目录: /opt/kiro/$BAK"               # 记下来,12.5 回滚�
 
 ### 12.4 验证(一分钟)
 
+**【EC2】**逐条执行,**每条的预期都必须满足,任何一条不满足 → 停止并按 §12.5 回滚**:
+
 ```bash
 systemctl is-active kiro-dashboard                     # active
 ss -ltn | grep -E ':80 |:3500 '                        # 两个端口都在
@@ -498,6 +521,8 @@ curl -s http://127.0.0.1:3500/api/users | head -c 200  # 能看到用户与 disp
 
 ### 12.5 回滚(万一)
 
+**【EC2】**:
+
 ```bash
 systemctl stop kiro-dashboard
 cd /opt/kiro && rm -rf kiro-dashboard && mv kiro-dashboard.bak.<12.3 打印的那个时间戳> kiro-dashboard
@@ -506,7 +531,7 @@ systemctl start kiro-dashboard
 
 **代码可以随时回滚;数据库不用回滚**——新版本加的列对旧代码完全透明(旧代码不读不写它们)。只有"新版本已写入、旧版本读不懂"的数据变更才需要动快照,本项目目前没有这种变更。
 
-### ⚠️ 12.6 三个必须避开的坑(实测踩过)
+### ⚠️ 12.6 四个必须避开的坑(实测踩过)
 
 1. **不要用 `scripts/remote-deploy.sh` 做升级**——它会**整个重写** `.env`,丢掉 `KIRO_S3_BUCKET`/`KIRO_ACCOUNT_ID` 等配置,导致 credit 同步被静默关闭。它只适合首次部署。
 2. **S3 固定文件名必须覆盖**(12.2 的 ⚠️),否则埋下"实例重建=代码回退"的雷。
@@ -517,6 +542,45 @@ systemctl start kiro-dashboard
    git 邮箱为聚合键,报表里像两个人(两行显示的**中文名相同**,行数各自正确,只是没合并)。
    这是修复"不可逆改写原始数据"的正确代价,**不是数据错误**;新数据积累后旧行影响自然稀释。
    若客户不能接受,合并方案见 `TODO-注意点与已知问题.md` S2 条(需业务拍板,勿自行改数据)。
+
+### 12.7 低权限路径(操作者只有「登录 EC2」+「数据库口令」,没有 RDS/S3 等 AWS API 权限)
+
+> 常见于客户现场:运维能进 EC2、知道数据库口令,但没有 AWS 管理台/API 权限。
+> 升级核心(12.3–12.5)本来就全在 EC2 上,不受影响;只有两个辅助步骤要换做法。
+
+**① 替代 12.1 的 RDS 快照 —— 用 pg_dump 逻辑备份**:
+
+**【EC2】**(连接信息就在机器上的 `.env` 里,不要改它,只是读):
+
+```bash
+sudo dnf install -y postgresql16                     # 装客户端,已装则跳过
+source /opt/kiro/kiro-dashboard/.env 2>/dev/null || export $(grep -v '^#' /opt/kiro/kiro-dashboard/.env | xargs)
+PGPASSWORD="$DB_PASSWORD" pg_dump -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
+  -Fc -f /opt/kiro/backup-before-upgrade-$(date +%Y%m%d-%H%M%S).dump
+ls -lh /opt/kiro/backup-before-upgrade-*.dump
+```
+> 预期:生成 `.dump` 文件且大小 > 0。失败(连不上/口令错)→ **停止上报,不要继续升级**(没有备份不升级)。
+
+**② 替代 12.2 的 S3 上传 —— 在 EC2 上直接从 GitHub 取码打包**(EC2 有公网出口,当初装 Node 就是走它):
+
+**【EC2】**:
+
+```bash
+⚠️ REF=main                                          # 或指定的发布分支/tag,以交付说明为准
+cd /tmp && rm -rf kiro-src
+git clone --depth 1 -b "$REF" https://github.com/liangyimingcom/kiro-coding-metrics-collector.git kiro-src
+tar -czf /tmp/new.tgz -C kiro-src/code kiro-dashboard
+tar -xzOf /tmp/new.tgz kiro-dashboard/src/store.js | md5sum    # 记下,应与交付说明里的新版指纹一致
+```
+> 预期:md5 与交付方给出的新版本指纹一致。不一致 → 停止,报告实际值。
+> 之后执行 12.3,只改一行:把 `aws s3 cp "s3://$BUCKET/..." /tmp/new.tgz && tar -xzf /tmp/new.tgz -C /opt/kiro`
+> **整行替换为** `tar -xzf /tmp/new.tgz -C /opt/kiro`(包已在 /tmp,只做解包;注意不能整行跳过,否则解包也被跳掉)。
+> 其余行一字不改。
+
+**③ 交接残留(必须写进升级记录,不能省)**:低权限路径没有覆盖 S3 上的正式包
+`kiro-dashboard-src.tgz`——**它还是旧代码**。若将来这台 EC2 被重建,开机会自动拉到旧版(隐性回退,见 12.6-2)。
+请把这句话原样转给有 S3 权限的团队:
+「请用新版代码重新打包并覆盖 `s3://<部署桶>/kiro-dashboard-src.tgz`,做法见部署手册 §12.2」。
 
 ---
 
